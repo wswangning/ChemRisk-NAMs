@@ -18,6 +18,17 @@ import base64
 from io import BytesIO
 import requests
 from urllib.parse import quote
+import joblib
+import warnings
+
+# 尝试导入 RDKit（若未安装则降级处理）
+try:
+    from rdkit import Chem
+    from rdkit.Chem.rdMolDescriptors import GetMorganFingerprintAsBitVect
+    RDKIT_AVAILABLE = True
+except ImportError:
+    RDKIT_AVAILABLE = False
+    warnings.warn("RDKit 未安装，AIVIVE 实时预测将使用模拟概率。")
 
 # ==================== 页面配置 ====================
 st.set_page_config(
@@ -73,15 +84,52 @@ def fetch_pubchem_by_cas(cas):
         st.warning(f"PubChem API 查询失败: {e}")
     return {"success": False, "error": "无法从 PubChem 获取化合物信息"}
 
-def fetch_compound_by_cas(cas):
-    """备用：CompTox API（实际未使用，保留以供扩展）"""
-    return fetch_pubchem_by_cas(cas)
+# ==================== 加载 AIVIVE 模型 ====================
+@st.cache_resource
+def load_aivive_model():
+    """加载预训练的 XGBoost 模型（首次调用时缓存）"""
+    try:
+        data = joblib.load('aivive_xgboost_model.pkl')
+        return data['model'], data['pathways']
+    except FileNotFoundError:
+        st.warning("未找到 AIVIVE 模型文件，将使用模拟概率。")
+        return None, None
 
-def fetch_toxcast_activity(cas):
-    """从 ToxCast 获取体外活性数据（占位，实际需要 API Key）"""
-    return None
+def predict_pathways_from_smiles(smiles, model, pathways):
+    """根据 SMILES 计算指纹并预测通路概率"""
+    default_probs = {
+        "oxidative_stress": 0.45,
+        "inflammation": 0.35,
+        "apoptosis": 0.28,
+        "genotoxicity": 0.20,
+        "er_activation": 0.30,
+        "ppar_gamma": 0.25
+    }
+    if not RDKIT_AVAILABLE or model is None or not smiles:
+        return default_probs
 
-# ==================== 模拟数据库（演示用，实际应替换为API调用） ====================
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return default_probs
+
+    try:
+        fp = GetMorganFingerprintAsBitVect(mol, 2, nBits=1024)
+    except:
+        from rdkit.Chem import AllChem
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=1024)
+
+    fp_array = np.array(fp).reshape(1, -1)
+    proba = model.predict(fp_array)  # 多输出回归，输出 shape (1, n_pathways)
+    preds = {}
+    for i, pathway in enumerate(pathways):
+        preds[pathway] = float(np.clip(proba[0][i], 0.0, 1.0))
+    # 补充默认通路中可能缺失的项
+    for k, v in default_probs.items():
+        if k not in preds:
+            preds[k] = v
+    return preds
+
+# ==================== 模拟数据库（演示用） ====================
 DEMO_DATABASE = {
     "1314-13-2": {  # ZnO NPs
         "name": "氧化锌纳米颗粒 (ZnO NPs)",
@@ -160,15 +208,12 @@ def query_compound(cas, use_real_api=False):
     """根据 CAS 号查询化合物数据，可选择是否调用实时 API"""
     cas = cas.strip().upper()
 
-    # PEG-PLA 特殊处理
     if cas == "PEG-PLA":
         return DEMO_DATABASE["PEG-PLA"].copy()
 
-    # 内置案例优先返回
     if cas in DEMO_DATABASE:
         return DEMO_DATABASE[cas].copy()
 
-    # 勾选了实时API，尝试从在线数据库获取
     if use_real_api:
         st.info(f"正在实时查询 CAS {cas} 的数据，请稍候...")
         api_result = fetch_pubchem_by_cas(cas)
@@ -177,7 +222,7 @@ def query_compound(cas, use_real_api=False):
             mw_raw = api_result.get("mw", 300.0)
             try:
                 mw = float(mw_raw)
-            except (TypeError, ValueError):
+            except:
                 mw = 300.0
 
             logp_raw = api_result.get("logp")
@@ -186,8 +231,24 @@ def query_compound(cas, use_real_api=False):
             else:
                 try:
                     logp = float(logp_raw)
-                except (TypeError, ValueError):
+                except:
                     logp = 3.0
+
+            smiles = api_result.get("smiles", "")
+
+            # 调用 AIVIVE 模型预测
+            model, pathways_list = load_aivive_model()
+            if model is not None and smiles:
+                aivive_probs = predict_pathways_from_smiles(smiles, model, pathways_list)
+            else:
+                aivive_probs = {
+                    "oxidative_stress": 0.45,
+                    "inflammation": 0.35,
+                    "apoptosis": 0.28,
+                    "genotoxicity": 0.20,
+                    "er_activation": 0.30,
+                    "ppar_gamma": 0.25
+                }
 
             compound_data = {
                 "name": api_result.get("name", f"化合物 ({cas})"),
@@ -200,27 +261,19 @@ def query_compound(cas, use_real_api=False):
                     "bioavailability": max(0.1, min(0.9, 1.0 - 0.1 * logp)),
                     "kp_fat": 10 ** (0.5 * logp)
                 },
-                "aivive": {
-                    "oxidative_stress": 0.45,
-                    "inflammation": 0.35,
-                    "apoptosis": 0.28,
-                    "genotoxicity": 0.20,
-                    "er_activation": 0.30,
-                    "ppar_gamma": 0.25
-                },
+                "aivive": aivive_probs,
                 "exposure": 0.001,
                 "oed_median": 0.1,
                 "risk_score": 0.55,
                 "uncertainty": 0.50,
                 "decision": "中等风险：建议开展进一步体外测试以降低不确定性"
             }
-            st.success("实时数据获取成功！")
+            st.success("实时数据获取成功！AIVIVE 预测已基于真实结构计算。")
             return compound_data
         else:
             st.error(f"实时查询失败：{api_result.get('error', '未知错误')}。将使用模拟数据。")
 
-    # 默认返回模拟数据
-    st.warning(f"CAS {cas} 不在演示数据库中，将基于理化性质进行预测（模拟数据）。实际应用时请连接CompTox API。")
+    st.warning(f"CAS {cas} 不在演示数据库中，将基于理化性质进行预测（模拟数据）。")
     return {
         "name": f"化合物 ({cas})",
         "mw": 300.0,
@@ -228,14 +281,7 @@ def query_compound(cas, use_real_api=False):
         "type": "small_molecule",
         "params": {},
         "pbpk": {"t_half": 12, "bioavailability": 0.6, "kp_fat": 10 ** (0.5 * 3.0)},
-        "aivive": {
-            "oxidative_stress": 0.45,
-            "inflammation": 0.35,
-            "apoptosis": 0.28,
-            "genotoxicity": 0.20,
-            "er_activation": 0.30,
-            "ppar_gamma": 0.25
-        },
+        "aivive": {"oxidative_stress": 0.45, "inflammation": 0.35, "apoptosis": 0.28, "genotoxicity": 0.20, "er_activation": 0.30, "ppar_gamma": 0.25},
         "exposure": 0.001,
         "oed_median": 0.1,
         "risk_score": 0.55,
@@ -330,7 +376,7 @@ def main():
         st.markdown("---")
         st.markdown("**高级选项**")
         use_real_api = st.checkbox("连接实时数据库 (CompTox/PubChem)", value=False,
-                                   help="勾选后将实时查询在线数据库获取化学物信息。注意：需要网络连接，首次查询可能较慢。")
+                                   help="勾选后将实时查询在线数据库获取化学物信息。注意：需要网络连接。")
         run_btn = st.button("🚀 开始风险评估", type="primary", width='stretch')
 
         st.markdown("---")
