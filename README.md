@@ -13,6 +13,12 @@ TRAEC（证据整合、不确定性量化与风险决策）
 
 安装
 
-```bash
-pip install -r requirements.txt
-python setup.py install
+确保以下文件位于项目根目录：
+aivive_xgboost_model.pkl（模型文件）
+安装依赖：
+bash
+pip install streamlit pandas numpy matplotlib plotly requests joblib rdkit-pypi xgboost
+启动应用：
+bash
+streamlit run app.py
+该版本已修复所有已知错误，并实现了基于真实结构的 AIVIVE 预测。测试时请勾选“连接实时数据库”，输入任意真实 CAS（如 58-08-2）验证。
